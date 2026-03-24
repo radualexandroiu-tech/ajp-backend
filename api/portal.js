@@ -1,78 +1,289 @@
-/**
- * Agenda Juridică – Proxy SOAP portal.just.ro
- * Fișier: api/portal.js  (merge în backend-ul Vercel)
- *
- * Rulează NON-STOP pe Vercel. Nu trebuie pornit zilnic.
- */
+// portal.js - Backend Vercel pentru Agenda Juridica
+// Proxy SOAP pentru portalquery.just.ro
+
 const http = require('http');
 
-function soapEnv(body) {
-  return `<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>${body}</soap:Body></soap:Envelope>`;
-}
-function x(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+module.exports = async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-function buildCautareDosare({numarDosar,obiectDosar,numeParte,institutie,dataStart,dataStop}) {
-  const ns='xmlns="portalquery.just.ro"';
-  return soapEnv(`<CautareDosare ${ns}>${numarDosar?`<numarDosar>${x(numarDosar)}</numarDosar>`:'<numarDosar xsi:nil="true"/>'}${obiectDosar?`<obiectDosar>${x(obiectDosar)}</obiectDosar>`:'<obiectDosar xsi:nil="true"/>'}${numeParte?`<numeParte>${x(numeParte)}</numeParte>`:'<numeParte xsi:nil="true"/>'}${institutie?`<institutie>${x(institutie)}</institutie>`:'<institutie xsi:nil="true"/>'}${dataStart?`<dataStart>${x(dataStart)}</dataStart>`:'<dataStart xsi:nil="true"/>'}${dataStop?`<dataStop>${x(dataStop)}</dataStop>`:'<dataStop xsi:nil="true"/>'}</CautareDosare>`);
-}
-function buildCautareSedinte({dataSedinta,institutie}) {
-  return soapEnv(`<CautareSedinte xmlns="portalquery.just.ro"><dataSedinta>${x(dataSedinta)}</dataSedinta><institutie>${x(institutie)}</institutie></CautareSedinte>`);
-}
-function buildHelloWorld() { return soapEnv('<HelloWorld xmlns="portalquery.just.ro"/>'); }
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  if (req.method !== 'POST') {
+    return res.status(200).json({ ok: false, eroare: 'Foloseste POST' });
+  }
 
-function callSoap(action, envelope) {
+  let body = '';
+  try {
+    body = await new Promise((resolve, reject) => {
+      let data = '';
+      req.on('data', chunk => { data += chunk; });
+      req.on('end', () => resolve(data));
+      req.on('error', reject);
+    });
+  } catch (e) {
+    return res.status(200).json({ ok: false, eroare: 'Eroare citire body: ' + e.message });
+  }
+
+  let params;
+  try {
+    params = JSON.parse(body);
+  } catch (e) {
+    return res.status(200).json({ ok: false, eroare: 'JSON invalid' });
+  }
+
+  const metoda = params.metoda || 'CautareDosare';
+
+  // Construieste XML SOAP
+  let soapBody = '';
+
+  if (metoda === 'HelloWorld') {
+    soapBody = '<HelloWorld xmlns="portalquery.just.ro" />';
+  } else if (metoda === 'CautareDosare' || metoda === 'CautareDosare2') {
+    const nr = params.numarDosar ? `<numarDosar>${escXml(params.numarDosar)}</numarDosar>` : '<numarDosar></numarDosar>';
+    const ob = params.obiectDosar ? `<obiectDosar>${escXml(params.obiectDosar)}</obiectDosar>` : '<obiectDosar></obiectDosar>';
+    const np = params.numeParte ? `<numeParte>${escXml(params.numeParte)}</numeParte>` : '<numeParte></numeParte>';
+    const inst = params.institutie ? `<institutie>${escXml(params.institutie)}</institutie>` : '<institutie></institutie>';
+
+    if (metoda === 'CautareDosare2') {
+      soapBody = `<CautareDosare2 xmlns="portalquery.just.ro">${nr}${ob}${np}${inst}<dataStart></dataStart><dataStop></dataStop><dataUltimaModificareStart></dataUltimaModificareStart><dataUltimaModificareStop></dataUltimaModificareStop></CautareDosare2>`;
+    } else {
+      soapBody = `<CautareDosare xmlns="portalquery.just.ro">${nr}${ob}${np}${inst}<dataStart></dataStart><dataStop></dataStop></CautareDosare>`;
+    }
+  } else if (metoda === 'CautareSedinte') {
+    soapBody = `<CautareSedinte xmlns="portalquery.just.ro"><dataSedinta>${escXml(params.dataSedinta || '')}</dataSedinta><institutie>${escXml(params.institutie || '')}</institutie></CautareSedinte>`;
+  } else {
+    return res.status(200).json({ ok: false, eroare: 'Metoda necunoscuta: ' + metoda });
+  }
+
+  const envelope = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>${soapBody}</soap:Body>
+</soap:Envelope>`;
+
+  const action = `portalquery.just.ro/${metoda}`;
+
+  // Trimite cererea SOAP catre portal cu timeout 25s
+  let xmlRespuns;
+  try {
+    xmlRespuns = await soapPost(envelope, action, 25000);
+  } catch (e) {
+    // Daca CautareDosare esueaza, incearca CautareDosare2
+    if (metoda === 'CautareDosare' && params.numarDosar) {
+      try {
+        const nr = `<numarDosar>${escXml(params.numarDosar)}</numarDosar>`;
+        const ob = '<obiectDosar></obiectDosar>';
+        const np = params.numeParte ? `<numeParte>${escXml(params.numeParte)}</numeParte>` : '<numeParte></numeParte>';
+        const inst = params.institutie ? `<institutie>${escXml(params.institutie)}</institutie>` : '<institutie></institutie>';
+        const env2 = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body><CautareDosare2 xmlns="portalquery.just.ro">${nr}${ob}${np}${inst}<dataStart></dataStart><dataStop></dataStop><dataUltimaModificareStart></dataUltimaModificareStart><dataUltimaModificareStop></dataUltimaModificareStop></CautareDosare2></soap:Body>
+</soap:Envelope>`;
+        xmlRespuns = await soapPost(env2, 'portalquery.just.ro/CautareDosare2', 25000);
+      } catch (e2) {
+        return res.status(200).json({ ok: false, eroare: 'Portal indisponibil: ' + e2.message });
+      }
+    } else {
+      return res.status(200).json({ ok: false, eroare: 'Portal indisponibil: ' + e.message });
+    }
+  }
+
+  // Parseaza XML
+  try {
+    const result = parseRaspuns(xmlRespuns, metoda);
+    return res.status(200).json({ ok: true, result: result });
+  } catch (e) {
+    return res.status(200).json({ ok: false, eroare: 'Eroare parsare XML: ' + e.message, xml: xmlRaspuns ? xmlRaspuns.substring(0, 500) : '' });
+  }
+};
+
+// ================================================================
+// HTTP request catre portalquery.just.ro
+// ================================================================
+function soapPost(envelope, soapAction, timeout) {
   return new Promise((resolve, reject) => {
-    const buf = Buffer.from(envelope, 'utf-8');
-    const req = http.request({ hostname:'portalquery.just.ro', port:80, path:'/query.asmx', method:'POST',
-      headers:{'Content-Type':'text/xml; charset=utf-8','SOAPAction':`"portalquery.just.ro/${action}"`,'Content-Length':buf.length}
-    }, res => { let d=''; res.setEncoding('utf8'); res.on('data',c=>d+=c); res.on('end',()=>resolve(d)); });
-    req.on('error', reject);
-    req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout portal')); });
-    req.write(buf); req.end();
+    const postData = Buffer.from(envelope, 'utf8');
+    const options = {
+      hostname: 'portalquery.just.ro',
+      port: 80,
+      path: '/query.asmx',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/xml; charset=utf-8',
+        'Content-Length': postData.length,
+        'SOAPAction': '"' + soapAction + '"',
+        'Host': 'portalquery.just.ro',
+        'Accept': 'text/xml',
+        'Connection': 'close'
+      }
+    };
+
+    const timer = setTimeout(() => {
+      req.destroy();
+      reject(new Error('Timeout dupa ' + (timeout / 1000) + 's'));
+    }, timeout);
+
+    const req = http.request(options, (resp) => {
+      let data = '';
+      resp.setEncoding('utf8');
+      resp.on('data', chunk => { data += chunk; });
+      resp.on('end', () => {
+        clearTimeout(timer);
+        if (resp.statusCode >= 400) {
+          reject(new Error('HTTP ' + resp.statusCode));
+        } else {
+          resolve(data);
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      clearTimeout(timer);
+      reject(new Error('Eroare conexiune: ' + e.message));
+    });
+
+    req.write(postData);
+    req.end();
   });
 }
 
-function getAll(xml, tag) { const re=new RegExp(`<(?:[^:>]+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</(?:[^:>]+:)?${tag}>`,'g');const out=[];let m;while((m=re.exec(xml))!==null)out.push(m[1]);return out; }
-function getOne(xml, tag) { const m=new RegExp(`<(?:[^:>]+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</(?:[^:>]+:)?${tag}>`).exec(xml);return m?m[1].trim():null; }
-function isNil(xml, tag) { return new RegExp(`<(?:[^:>]+:)?${tag}[^>]+xsi:nil="true"`).test(xml); }
+// ================================================================
+// Parsare XML raspuns
+// ================================================================
+function parseRaspuns(xml, metoda) {
+  if (!xml) return [];
 
-function parseSed(xml) { return { complet:getOne(xml,'complet')||'', data:getOne(xml,'data')||'', ora:getOne(xml,'ora')||'', solutie:getOne(xml,'solutie')||'', solutieSumar:getOne(xml,'solutieSumar')||'', dataPronuntare:isNil(xml,'dataPronuntare')?null:getOne(xml,'dataPronuntare'), numarDocument:getOne(xml,'numarDocument')||'' }; }
-function parseDosar(xml) { return { numar:getOne(xml,'numar')||'', numarVechi:getOne(xml,'numarVechi')||'', data:getOne(xml,'data')||'', institutie:getOne(xml,'institutie')||'', departament:getOne(xml,'departament')||'', categorieCaz:getOne(xml,'categorieCaz')||'', stadiuProcesual:getOne(xml,'stadiuProcesual')||'', obiect:getOne(xml,'obiect')||'', parti:getAll(xml,'DosarParte').map(p=>({nume:getOne(p,'nume')||'',calitateParte:getOne(p,'calitateParte')||''})), sedinte:getAll(xml,'DosarSedinta').map(parseSed), caiAtac:getAll(xml,'DosarCaleAtac').map(c=>({dataDeclarare:isNil(c,'dataDeclarare')?null:getOne(c,'dataDeclarare'),parteDeclaratoare:getOne(c,'parteDeclaratoare')||'',tipCaleAtac:getOne(c,'tipCaleAtac')||''})) }; }
-function parseSedintaC(xml) { return { departament:getOne(xml,'departament')||'', complet:getOne(xml,'complet')||'', data:getOne(xml,'data')||'', ora:getOne(xml,'ora')||'', dosare:getAll(xml,'SedintaDosar').map(s=>({numar:getOne(s,'numar')||'',data:getOne(s,'data')||'',ora:getOne(s,'ora')||'',categorieCaz:getOne(s,'categorieCaz')||'',stadiuProcesual:getOne(s,'stadiuProcesual')||''})) }; }
-
-module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin','*');
-  res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers','Content-Type');
-  if (req.method==='OPTIONS') return res.status(200).end();
-  if (req.method!=='POST') return res.status(405).json({eroare:'Foloseste POST'});
-
-  let body = req.body;
-  if (!body) {
-    try { const chunks=[]; for await (const c of req) chunks.push(c); body=JSON.parse(Buffer.concat(chunks).toString()); }
-    catch { return res.status(400).json({eroare:'Body JSON invalid'}); }
+  if (metoda === 'HelloWorld') {
+    const m = xml.match(/<HelloWorldResult>([\s\S]*?)<\/HelloWorldResult>/i);
+    return m ? m[1] : 'OK';
   }
 
-  const {metoda} = body||{};
-  try {
-    let envelope, action, parse;
-    if (metoda==='CautareDosare') {
-      envelope=buildCautareDosare(body); action='CautareDosare';
-      parse=xml=>{const r=getOne(xml,'CautareDosareResult');return r?getAll(r,'Dosar').map(parseDosar):[];};
-    } else if (metoda==='CautareSedinte') {
-      envelope=buildCautareSedinte(body); action='CautareSedinte';
-      parse=xml=>{const r=getOne(xml,'CautareSedinteResult');return r?getAll(r,'Sedinta').map(parseSedintaC):[];};
-    } else if (metoda==='HelloWorld') {
-      envelope=buildHelloWorld(); action='HelloWorld';
-      parse=xml=>({mesaj:getOne(xml,'HelloWorldResult')||''});
-    } else {
-      return res.status(400).json({eroare:`Metoda necunoscuta: ${metoda}`});
-    }
-    const xml = await callSoap(action, envelope);
-    const result = parse(xml);
-    return res.status(200).json({ok:true, result});
-  } catch(err) {
-    console.error('[portal.js]', err.message);
-    return res.status(500).json({ok:false, eroare:err.message});
+  if (metoda === 'CautareSedinte') {
+    return parseSedinte(xml);
   }
-};
+
+  // CautareDosare sau CautareDosare2
+  return parseDosare(xml);
+}
+
+function parseDosare(xml) {
+  const dosare = [];
+  // Extrage toate elementele Dosar
+  const dosarRegex = /<Dosar[^>]*>([\s\S]*?)<\/Dosar>/gi;
+  let match;
+  while ((match = dosarRegex.exec(xml)) !== null) {
+    const d = match[1];
+    if (!d || d.includes('xsi:nil="true"')) continue;
+
+    const dosar = {
+      numar: getTag(d, 'numar'),
+      numarVechi: getTag(d, 'numarVechi'),
+      data: getTag(d, 'data'),
+      institutie: getTag(d, 'institutie'),
+      departament: getTag(d, 'departament'),
+      categorieCaz: getTag(d, 'categorieCaz'),
+      stadiuProcesual: getTag(d, 'stadiuProcesual'),
+      obiect: getTag(d, 'obiect'),
+      dataModificare: getTag(d, 'dataModificare'),
+      parti: parseParti(d),
+      sedinte: parseSedinteDin(d),
+      caiAtac: parseCaiAtac(d)
+    };
+
+    if (dosar.numar) dosare.push(dosar);
+  }
+  return dosare;
+}
+
+function parseParti(xml) {
+  const parti = [];
+  const regex = /<DosarParte[^>]*>([\s\S]*?)<\/DosarParte>/gi;
+  let m;
+  while ((m = regex.exec(xml)) !== null) {
+    const p = m[1];
+    if (!p || p.includes('xsi:nil="true"')) continue;
+    parti.push({
+      nume: getTag(p, 'nume'),
+      calitateParte: getTag(p, 'calitateParte')
+    });
+  }
+  return parti;
+}
+
+function parseSedinteDin(xml) {
+  const sedinte = [];
+  // Extrage sectiunea <sedinte>...</sedinte>
+  const secMatch = xml.match(/<sedinte[^>]*>([\s\S]*?)<\/sedinte>/i);
+  if (!secMatch) return sedinte;
+  const sec = secMatch[1];
+
+  const regex = /<DosarSedinta[^>]*>([\s\S]*?)<\/DosarSedinta>/gi;
+  let m;
+  while ((m = regex.exec(sec)) !== null) {
+    const s = m[1];
+    if (!s || s.includes('xsi:nil="true"')) continue;
+    sedinte.push({
+      complet: getTag(s, 'complet'),
+      data: getTag(s, 'data'),
+      ora: getTag(s, 'ora'),
+      solutie: getTag(s, 'solutie'),
+      solutieSumar: getTag(s, 'solutieSumar'),
+      dataPronuntare: getTag(s, 'dataPronuntare'),
+      numarDocument: getTag(s, 'numarDocument')
+    });
+  }
+  return sedinte;
+}
+
+function parseSedinte(xml) {
+  const sedinte = [];
+  const regex = /<Sedinta[^>]*>([\s\S]*?)<\/Sedinta>/gi;
+  let m;
+  while ((m = regex.exec(xml)) !== null) {
+    const s = m[1];
+    if (!s || s.includes('xsi:nil="true"')) continue;
+    sedinte.push({
+      complet: getTag(s, 'complet'),
+      data: getTag(s, 'data'),
+      ora: getTag(s, 'ora'),
+      solutie: getTag(s, 'solutie'),
+      solutieSumar: getTag(s, 'solutieSumar')
+    });
+  }
+  return sedinte;
+}
+
+function parseCaiAtac(xml) {
+  const cai = [];
+  const secMatch = xml.match(/<caiAtac[^>]*>([\s\S]*?)<\/caiAtac>/i);
+  if (!secMatch) return cai;
+  const sec = secMatch[1];
+  const regex = /<DosarCaleAtac[^>]*>([\s\S]*?)<\/DosarCaleAtac>/gi;
+  let m;
+  while ((m = regex.exec(sec)) !== null) {
+    const c = m[1];
+    if (!c || c.includes('xsi:nil="true"')) continue;
+    cai.push({
+      caleAtac: getTag(c, 'caleAtac'),
+      data: getTag(c, 'data')
+    });
+  }
+  return cai;
+}
+
+function getTag(xml, tag) {
+  const m = xml.match(new RegExp('<' + tag + '[^>]*>([\\s\\S]*?)<\\/' + tag + '>', 'i'));
+  if (!m) return '';
+  return m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'").replace(/&quot;/g, '"').trim();
+}
+
+function escXml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
